@@ -69,7 +69,7 @@ void dump_script_json(const char *game_data_dir) {
                 first_method = false;
                 
                 const char *method_name = il2cpp_method_get_name(method);
-                void *method_ptr = reinterpret_cast<void *>(const_cast<Il2CppMethodPointer>(method->methodPointer));
+                void *method_ptr = reinterpret_cast<void *>(method->methodPointer);
                 uint32_t iflags = 0;
                 auto flags = il2cpp_method_get_flags(method, &iflags);
                 auto param_count = il2cpp_method_get_param_count(method);
@@ -152,4 +152,5 @@ void dump_script_json(const char *game_data_dir) {
     
     LOGI("Successfully generated script.json: %s", outPath.c_str());
 }
+
 
