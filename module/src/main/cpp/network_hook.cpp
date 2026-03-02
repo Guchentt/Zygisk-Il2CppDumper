@@ -40,44 +40,73 @@ static void (*XNetwork_ProcessMessage_Original)(void *msg, int32_t seqNo) = null
 // VA: 0x7709379335d8
 static void (*XHttp_PostAsync_Original)(void *url_str, void *content_str) = nullptr;
 
-// Helper function to get string from Il2CppString
+// Helper function to get string from Il2CppString (safe version)
 static std::string get_il2cpp_string(void *str_obj) {
-    if (!str_obj) return "";
+    if (!str_obj) return "[null]";
     
     // Il2CppString layout: length (offset 0x10), chars (offset 0x14)
-    // Read directly from memory (no exception handling since exceptions are disabled)
-    int32_t length = *(int32_t*)((uint8_t*)str_obj + 0x10);
-    if (length > 0 && length < 10000) {
-        char16_t *chars = (char16_t*)((uint8_t*)str_obj + 0x14);
+    // Read directly from memory with bounds checking
+    uint8_t *base = (uint8_t*)str_obj;
+    
+    // Check if memory is readable (basic check)
+    if ((uintptr_t)base < 0x1000 || (uintptr_t)base > 0x7FFFFFFFFFFFFFFF) {
+        return "[invalid_ptr]";
+    }
+    
+    int32_t length = 0;
+    // Try to read length safely
+    __builtin_memcpy(&length, base + 0x10, sizeof(int32_t));
+    
+    if (length > 0 && length < 1000) {  // Reduced max length for safety
+        char16_t *chars = (char16_t*)(base + 0x14);
         std::string result;
         result.reserve(length);
-        for (int i = 0; i < length; i++) {
-            if (chars[i] < 128) {
-                result += (char)chars[i];
+        for (int i = 0; i < length && i < 1000; i++) {
+            uint16_t c = chars[i];
+            if (c < 128 && c != 0) {
+                result += (char)c;
             }
+        }
+        if (result.empty()) {
+            return "[empty_string]";
         }
         return result;
     }
-    return "[Unable to read string]";
+    return "[invalid_length]";
 }
 
-// Helper function to get byte array info
+// Helper function to get byte array info (safe version)
 static std::string get_byte_array_info(void *array_obj) {
-    if (!array_obj) return "null";
+    if (!array_obj) return "[null]";
     
     // Il2CppArray layout: length (offset 0x18), data (offset 0x20)
-    // Read directly from memory (no exception handling since exceptions are disabled)
-    int32_t length = *(int32_t*)((uint8_t*)array_obj + 0x18);
-    if (length > 0 && length < 1000000) {
+    // Read directly from memory with bounds checking
+    uint8_t *base = (uint8_t*)array_obj;
+    
+    // Check if memory is readable
+    if ((uintptr_t)base < 0x1000 || (uintptr_t)base > 0x7FFFFFFFFFFFFFFF) {
+        return "[invalid_ptr]";
+    }
+    
+    int32_t length = 0;
+    __builtin_memcpy(&length, base + 0x18, sizeof(int32_t));
+    
+    if (length >= 0 && length < 1000000) {
         char buffer[64];
-        snprintf(buffer, sizeof(buffer), "ByteArray[%d bytes]", length);
+        snprintf(buffer, sizeof(buffer), "ByteArray[%d]", length);
         return buffer;
     }
-    return "[Unable to read array]";
+    return "[invalid_length]";
 }
 
 // Hook wrapper for XNetwork.Send
 static void XNetwork_Send_String_ByteArray_Hook_Wrapper(void *handler_str, void *content_bytes) {
+    // Call original function FIRST to avoid blocking
+    if (XNetwork_Send_String_ByteArray_Original) {
+        XNetwork_Send_String_ByteArray_Original(handler_str, content_bytes);
+    }
+    
+    // Then log (non-blocking)
     std::string handler = get_il2cpp_string(handler_str);
     std::string content_info = get_byte_array_info(content_bytes);
     
@@ -85,15 +114,16 @@ static void XNetwork_Send_String_ByteArray_Hook_Wrapper(void *handler_str, void 
     LOGI("Handler: %s", handler.c_str());
     LOGI("Content: %s", content_info.c_str());
     LOGI("===================");
-    
-    // Call original function
-    if (XNetwork_Send_String_ByteArray_Original) {
-        XNetwork_Send_String_ByteArray_Original(handler_str, content_bytes);
-    }
 }
 
 // Hook wrapper for XNetwork.Call
 static void XNetwork_Call_String_ByteArray_Hook_Wrapper(void *handler_str, void *content_bytes, void *reply, void *exceptionReply, bool excludeMask) {
+    // Call original function FIRST to avoid blocking
+    if (XNetwork_Call_String_ByteArray_Original) {
+        XNetwork_Call_String_ByteArray_Original(handler_str, content_bytes, reply, exceptionReply, excludeMask);
+    }
+    
+    // Then log (non-blocking)
     std::string handler = get_il2cpp_string(handler_str);
     std::string content_info = get_byte_array_info(content_bytes);
     
@@ -102,28 +132,30 @@ static void XNetwork_Call_String_ByteArray_Hook_Wrapper(void *handler_str, void 
     LOGI("Content: %s", content_info.c_str());
     LOGI("ExcludeMask: %s", excludeMask ? "true" : "false");
     LOGI("===================");
-    
-    // Call original function
-    if (XNetwork_Call_String_ByteArray_Original) {
-        XNetwork_Call_String_ByteArray_Original(handler_str, content_bytes, reply, exceptionReply, excludeMask);
-    }
 }
 
 // Hook wrapper for XNetwork.ProcessMessage
 static void XNetwork_ProcessMessage_Hook_Wrapper(void *msg, int32_t seqNo) {
+    // Call original function FIRST to avoid blocking
+    if (XNetwork_ProcessMessage_Original) {
+        XNetwork_ProcessMessage_Original(msg, seqNo);
+    }
+    
+    // Then log (non-blocking)
     LOGI("=== NETWORK RECEIVE ===");
     LOGI("Message SeqNo: %d", seqNo);
     LOGI("Message Object: %p", msg);
     LOGI("======================");
-    
-    // Call original function
-    if (XNetwork_ProcessMessage_Original) {
-        XNetwork_ProcessMessage_Original(msg, seqNo);
-    }
 }
 
 // Hook wrapper for XHttp.PostAsync
 static void XHttp_PostAsync_Hook_Wrapper(void *url_str, void *content_str) {
+    // Call original function FIRST to avoid blocking
+    if (XHttp_PostAsync_Original) {
+        XHttp_PostAsync_Original(url_str, content_str);
+    }
+    
+    // Then log (non-blocking)
     std::string url = get_il2cpp_string(url_str);
     std::string content = get_il2cpp_string(content_str);
     
@@ -131,11 +163,6 @@ static void XHttp_PostAsync_Hook_Wrapper(void *url_str, void *content_str) {
     LOGI("URL: %s", url.c_str());
     LOGI("Content: %s", content.c_str());
     LOGI("================");
-    
-    // Call original function
-    if (XHttp_PostAsync_Original) {
-        XHttp_PostAsync_Original(url_str, content_str);
-    }
 }
 
 // Install function hook using inline hook with trampoline
@@ -305,7 +332,6 @@ void hook_network_methods(void *il2cpp_handle) {
     
     LOGI("Network hooks installation completed");
 }
-
 
 
 
