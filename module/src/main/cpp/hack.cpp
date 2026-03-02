@@ -6,6 +6,7 @@
 #include "il2cpp_dump.h"
 #include "metadata_dump.h"
 #include "script_dump.h"
+#include "network_hook.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
@@ -42,6 +43,10 @@ void hack_start(const char *game_data_dir) {
             // 3. Generate script.json - Script mapping for IDA
             LOGI("[3/3] Generating script.json...");
             dump_script_json(game_data_dir);
+            
+            // 4. Install network hooks for logging network communication
+            LOGI("[4/4] Installing network hooks...");
+            hook_network_methods(handle);
             
             LOGI("==========================================");
             LOGI("All files exported successfully!");
