@@ -10,11 +10,11 @@
 
 // Enable/disable network hooking
 // Set to 0 to disable network hooks (game will run normally)
-#define ENABLE_NETWORK_HOOK 1
+#define ENABLE_NETWORK_HOOK 0
 
 // Hook network methods to log network communication
-void hook_network_methods(void *il2cpp_handle);
+// Reads method addresses from script.json and installs hooks
+void hook_network_methods(void *il2cpp_handle, const char *game_data_dir);
 
 #endif //ZYGISK_IL2CPPDUMPER_NETWORK_HOOK_H
-
 

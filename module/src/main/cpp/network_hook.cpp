@@ -10,15 +10,122 @@
 #include <cstring>
 #include <cinttypes>
 #include <string>
+#include <fstream>
+#include <sstream>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #if !ENABLE_NETWORK_HOOK
 // Hook disabled, provide empty implementation
-void hook_network_methods(void *il2cpp_handle) {
+void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
     LOGI("Network hooks are disabled");
 }
 #else
+
+// Simple JSON parser to extract method VA from script.json
+// param_count: -1 means any, otherwise match specific parameter count
+static uint64_t find_method_va_from_json(const std::string& json_content, 
+                                         const std::string& class_name, 
+                                         const std::string& method_name,
+                                         int param_count = -1) {
+    // Look for pattern: "name": "ClassName" followed by methods array
+    // Then find "name": "MethodName" with matching paramCount and extract "va": "0x..."
+    
+    size_t class_pos = json_content.find("\"name\": \"" + class_name + "\"");
+    if (class_pos == std::string::npos) {
+        LOGW("Class %s not found in script.json", class_name.c_str());
+        return 0;
+    }
+    
+    // Find methods array after class name
+    size_t methods_pos = json_content.find("\"methods\": [", class_pos);
+    if (methods_pos == std::string::npos) {
+        LOGW("Methods array not found for class %s", class_name.c_str());
+        return 0;
+    }
+    
+    // Find the end of methods array (to limit search scope)
+    size_t methods_end = json_content.find("],", methods_pos);
+    if (methods_end == std::string::npos) {
+        methods_end = json_content.find("\n          ]", methods_pos);
+    }
+    if (methods_end == std::string::npos) {
+        methods_end = json_content.length();
+    }
+    
+    // Search for method name within methods array
+    size_t search_pos = methods_pos;
+    while (true) {
+        size_t method_name_pos = json_content.find("\"name\": \"" + method_name + "\"", search_pos);
+        if (method_name_pos == std::string::npos || method_name_pos > methods_end) {
+            LOGW("Method %s::%s not found in script.json", class_name.c_str(), method_name.c_str());
+            return 0;
+        }
+        
+        // Check paramCount if specified
+        if (param_count >= 0) {
+            size_t param_count_pos = json_content.find("\"paramCount\":", method_name_pos);
+            if (param_count_pos != std::string::npos && param_count_pos < methods_end) {
+                size_t param_value_start = json_content.find_first_of("0123456789", param_count_pos + 13);
+                if (param_value_start != std::string::npos) {
+                    size_t param_value_end = json_content.find_first_not_of("0123456789", param_value_start);
+                    std::string param_str = json_content.substr(param_value_start, param_value_end - param_value_start);
+                    int found_param_count = std::stoi(param_str);
+                    
+                    if (found_param_count != param_count) {
+                        // Not the right overload, continue searching
+                        search_pos = method_name_pos + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // Find "va" field after method name
+        size_t va_pos = json_content.find("\"va\":", method_name_pos);
+        if (va_pos == std::string::npos || va_pos > methods_end) {
+            search_pos = method_name_pos + 1;
+            continue;
+        }
+        
+        // Extract hex value: "va": "0x1234567890abcdef"
+        size_t quote_start = json_content.find('"', va_pos + 5);
+        if (quote_start == std::string::npos || quote_start > methods_end) {
+            search_pos = method_name_pos + 1;
+            continue;
+        }
+        
+        size_t quote_end = json_content.find('"', quote_start + 1);
+        if (quote_end == std::string::npos || quote_end > methods_end) {
+            search_pos = method_name_pos + 1;
+            continue;
+        }
+        
+        std::string va_str = json_content.substr(quote_start + 1, quote_end - quote_start - 1);
+        
+        // Parse hex string
+        uint64_t va = 0;
+        if (va_str.length() > 2 && va_str.substr(0, 2) == "0x") {
+            std::istringstream iss(va_str);
+            iss >> std::hex >> va;
+        } else if (!va_str.empty() && va_str != "0") {
+            std::istringstream iss(va_str);
+            iss >> std::hex >> va;
+        }
+        
+        // Validate VA (should be non-zero and reasonable)
+        if (va != 0 && va > 0x1000000 && va < 0x7FFFFFFFFFFFFFFF) {
+            LOGI("Found %s::%s (paramCount=%d) at VA: 0x%" PRIx64, 
+                 class_name.c_str(), method_name.c_str(), param_count, va);
+            return va;
+        }
+        
+        // Invalid VA, continue searching
+        search_pos = method_name_pos + 1;
+    }
+    
+    return 0;
+}
 
 // Il2Cpp base address
 extern uint64_t il2cpp_base;
@@ -284,57 +391,94 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
 }
 
 // Hook network methods
-void hook_network_methods(void *il2cpp_handle) {
-    LOGI("Installing network hooks...");
+void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
+    LOGI("Installing network hooks from script.json...");
     
     if (!il2cpp_handle) {
         LOGE("Invalid il2cpp handle");
         return;
     }
     
-    // Calculate absolute addresses from RVA offsets
-    // XNetwork.Send(String, Byte[]) - RVA: 0x4acbbf8, VA: 0x770936decbf8
-    uint64_t XNetwork_Send_VA = il2cpp_base + 0x4acbbf8;
+    if (!game_data_dir) {
+        LOGE("Invalid game_data_dir");
+        return;
+    }
     
-    // XNetwork.Call(String, Byte[], ...) - RVA: 0x4acbd20, VA: 0x770936decd20
-    uint64_t XNetwork_Call_VA = il2cpp_base + 0x4acbd20;
+    // Read script.json file
+    std::string script_json_path = std::string(game_data_dir) + "/files/script.json";
+    std::ifstream json_file(script_json_path);
+    if (!json_file) {
+        LOGE("Failed to open script.json: %s", script_json_path.c_str());
+        return;
+    }
     
-    // XNetwork.ProcessMessage(Object, Int32) - RVA: 0x4acb648, VA: 0x770936dec648
-    uint64_t XNetwork_ProcessMessage_VA = il2cpp_base + 0x4acb648;
+    // Read entire file into string
+    std::stringstream json_buffer;
+    json_buffer << json_file.rdbuf();
+    std::string json_content = json_buffer.str();
+    json_file.close();
     
-    // XHttp.PostAsync(String, String) - RVA: 0x56125d8, VA: 0x7709379335d8
-    uint64_t XHttp_PostAsync_VA = il2cpp_base + 0x56125d8;
+    LOGI("Loaded script.json (%zu bytes)", json_content.size());
+    
+    // Extract method addresses from JSON
+    // XNetwork.Send(String, Byte[]) - paramCount=2
+    uint64_t XNetwork_Send_VA = find_method_va_from_json(json_content, "XNetwork", "Send", 2);
+    
+    // XNetwork.Call(String, Byte[], Action, Action, bool) - paramCount=5
+    uint64_t XNetwork_Call_VA = find_method_va_from_json(json_content, "XNetwork", "Call", 5);
+    
+    // XNetwork.ProcessMessage(Object, Int32) - paramCount=2
+    uint64_t XNetwork_ProcessMessage_VA = find_method_va_from_json(json_content, "XNetwork", "ProcessMessage", 2);
+    
+    // XHttp.PostAsync(String, String) - paramCount=2
+    uint64_t XHttp_PostAsync_VA = find_method_va_from_json(json_content, "XHttp", "PostAsync", 2);
     
     // Wait a bit for il2cpp to fully initialize
     sleep(2);
     
     // Install hooks
-    LOGI("Hooking XNetwork.Send at %p", (void*)XNetwork_Send_VA);
-    if (install_hook((void*)XNetwork_Send_VA, (void*)XNetwork_Send_String_ByteArray_Hook_Wrapper, &XNetwork_Send_String_ByteArray_Original)) {
-        LOGI("✓ XNetwork.Send hooked successfully");
+    if (XNetwork_Send_VA != 0) {
+        LOGI("Hooking XNetwork.Send at %p", (void*)XNetwork_Send_VA);
+        if (install_hook((void*)XNetwork_Send_VA, (void*)XNetwork_Send_String_ByteArray_Hook_Wrapper, &XNetwork_Send_String_ByteArray_Original)) {
+            LOGI("✓ XNetwork.Send hooked successfully");
+        } else {
+            LOGW("✗ Failed to hook XNetwork.Send");
+        }
     } else {
-        LOGW("✗ Failed to hook XNetwork.Send");
+        LOGW("✗ XNetwork.Send address not found in script.json");
     }
     
-    LOGI("Hooking XNetwork.Call at %p", (void*)XNetwork_Call_VA);
-    if (install_hook((void*)XNetwork_Call_VA, (void*)XNetwork_Call_String_ByteArray_Hook_Wrapper, &XNetwork_Call_String_ByteArray_Original)) {
-        LOGI("✓ XNetwork.Call hooked successfully");
+    if (XNetwork_Call_VA != 0) {
+        LOGI("Hooking XNetwork.Call at %p", (void*)XNetwork_Call_VA);
+        if (install_hook((void*)XNetwork_Call_VA, (void*)XNetwork_Call_String_ByteArray_Hook_Wrapper, &XNetwork_Call_String_ByteArray_Original)) {
+            LOGI("✓ XNetwork.Call hooked successfully");
+        } else {
+            LOGW("✗ Failed to hook XNetwork.Call");
+        }
     } else {
-        LOGW("✗ Failed to hook XNetwork.Call");
+        LOGW("✗ XNetwork.Call address not found in script.json");
     }
     
-    LOGI("Hooking XNetwork.ProcessMessage at %p", (void*)XNetwork_ProcessMessage_VA);
-    if (install_hook((void*)XNetwork_ProcessMessage_VA, (void*)XNetwork_ProcessMessage_Hook_Wrapper, &XNetwork_ProcessMessage_Original)) {
-        LOGI("✓ XNetwork.ProcessMessage hooked successfully");
+    if (XNetwork_ProcessMessage_VA != 0) {
+        LOGI("Hooking XNetwork.ProcessMessage at %p", (void*)XNetwork_ProcessMessage_VA);
+        if (install_hook((void*)XNetwork_ProcessMessage_VA, (void*)XNetwork_ProcessMessage_Hook_Wrapper, &XNetwork_ProcessMessage_Original)) {
+            LOGI("✓ XNetwork.ProcessMessage hooked successfully");
+        } else {
+            LOGW("✗ Failed to hook XNetwork.ProcessMessage");
+        }
     } else {
-        LOGW("✗ Failed to hook XNetwork.ProcessMessage");
+        LOGW("✗ XNetwork.ProcessMessage address not found in script.json");
     }
     
-    LOGI("Hooking XHttp.PostAsync at %p", (void*)XHttp_PostAsync_VA);
-    if (install_hook((void*)XHttp_PostAsync_VA, (void*)XHttp_PostAsync_Hook_Wrapper, &XHttp_PostAsync_Original)) {
-        LOGI("✓ XHttp.PostAsync hooked successfully");
+    if (XHttp_PostAsync_VA != 0) {
+        LOGI("Hooking XHttp.PostAsync at %p", (void*)XHttp_PostAsync_VA);
+        if (install_hook((void*)XHttp_PostAsync_VA, (void*)XHttp_PostAsync_Hook_Wrapper, &XHttp_PostAsync_Original)) {
+            LOGI("✓ XHttp.PostAsync hooked successfully");
+        } else {
+            LOGW("✗ Failed to hook XHttp.PostAsync");
+        }
     } else {
-        LOGW("✗ Failed to hook XHttp.PostAsync");
+        LOGW("✗ XHttp.PostAsync address not found in script.json");
     }
     
     LOGI("Network hooks installation completed");
