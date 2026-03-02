@@ -10,7 +10,7 @@
 
 // Enable/disable network hooking
 // Set to 0 to disable network hooks (game will run normally)
-#define ENABLE_NETWORK_HOOK 0
+#define ENABLE_NETWORK_HOOK 1
 
 // Hook network methods to log network communication
 // Reads method addresses from script.json and installs hooks
