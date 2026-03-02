@@ -44,28 +44,19 @@ static void (*XHttp_PostAsync_Original)(void *url_str, void *content_str) = null
 static std::string get_il2cpp_string(void *str_obj) {
     if (!str_obj) return "";
     
-    // Il2CppString structure: length (int32) + chars (char16_t[])
-    // Try to get string via il2cpp API if available
-    extern const Il2CppType* (*il2cpp_string_get_type)();
-    extern void* (*il2cpp_string_new)(const char*);
-    
-    // Fallback: try to read directly from memory
     // Il2CppString layout: length (offset 0x10), chars (offset 0x14)
-    try {
-        int32_t length = *(int32_t*)((uint8_t*)str_obj + 0x10);
-        if (length > 0 && length < 10000) {
-            char16_t *chars = (char16_t*)((uint8_t*)str_obj + 0x14);
-            std::string result;
-            result.reserve(length);
-            for (int i = 0; i < length; i++) {
-                if (chars[i] < 128) {
-                    result += (char)chars[i];
-                }
+    // Read directly from memory (no exception handling since exceptions are disabled)
+    int32_t length = *(int32_t*)((uint8_t*)str_obj + 0x10);
+    if (length > 0 && length < 10000) {
+        char16_t *chars = (char16_t*)((uint8_t*)str_obj + 0x14);
+        std::string result;
+        result.reserve(length);
+        for (int i = 0; i < length; i++) {
+            if (chars[i] < 128) {
+                result += (char)chars[i];
             }
-            return result;
         }
-    } catch (...) {
-        // Ignore errors
+        return result;
     }
     return "[Unable to read string]";
 }
@@ -74,16 +65,13 @@ static std::string get_il2cpp_string(void *str_obj) {
 static std::string get_byte_array_info(void *array_obj) {
     if (!array_obj) return "null";
     
-    try {
-        // Il2CppArray layout: length (offset 0x18), data (offset 0x20)
-        int32_t length = *(int32_t*)((uint8_t*)array_obj + 0x18);
-        if (length > 0 && length < 1000000) {
-            char buffer[64];
-            snprintf(buffer, sizeof(buffer), "ByteArray[%d bytes]", length);
-            return buffer;
-        }
-    } catch (...) {
-        // Ignore errors
+    // Il2CppArray layout: length (offset 0x18), data (offset 0x20)
+    // Read directly from memory (no exception handling since exceptions are disabled)
+    int32_t length = *(int32_t*)((uint8_t*)array_obj + 0x18);
+    if (length > 0 && length < 1000000) {
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "ByteArray[%d bytes]", length);
+        return buffer;
     }
     return "[Unable to read array]";
 }
@@ -248,4 +236,7 @@ void hook_network_methods(void *il2cpp_handle) {
     
     LOGI("Network hooks installation completed");
 }
+
+
+
 
