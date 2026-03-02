@@ -13,6 +13,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if !ENABLE_NETWORK_HOOK
+// Hook disabled, provide empty implementation
+void hook_network_methods(void *il2cpp_handle) {
+    LOGI("Network hooks are disabled");
+}
+#else
+
 // Il2Cpp base address
 extern uint64_t il2cpp_base;
 
@@ -333,6 +340,5 @@ void hook_network_methods(void *il2cpp_handle) {
     LOGI("Network hooks installation completed");
 }
 
-
-
+#endif // ENABLE_NETWORK_HOOK
 

@@ -37,7 +37,6 @@ add_library(${MODULE_NAME} SHARED
         main.cpp
         hack.cpp
         il2cpp_dump.cpp
-        metadata_dump.cpp
         script_dump.cpp
         network_hook.cpp
         ${xdl-src})

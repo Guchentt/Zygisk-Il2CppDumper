@@ -4,7 +4,6 @@
 
 #include "hack.h"
 #include "il2cpp_dump.h"
-#include "metadata_dump.h"
 #include "script_dump.h"
 #include "network_hook.h"
 #include "log.h"
@@ -33,23 +32,26 @@ void hack_start(const char *game_data_dir) {
             il2cpp_api_init(handle);
             
             // 1. Generate dump.cs - C# source code
-            LOGI("[1/3] Generating dump.cs...");
+            LOGI("[1/2] Generating dump.cs...");
             il2cpp_dump(game_data_dir);
             
-            // 2. Export global-metadata.dat - Decrypted metadata file
-            LOGI("[2/3] Exporting global-metadata.dat...");
-            dump_global_metadata(game_data_dir);
-            
-            // 3. Generate script.json - Script mapping for IDA
-            LOGI("[3/3] Generating script.json...");
+            // 2. Generate script.json - Script mapping for IDA
+            LOGI("[2/2] Generating script.json...");
             dump_script_json(game_data_dir);
             
-            // 4. Install network hooks for logging network communication
-            LOGI("[4/4] Installing network hooks...");
+            // 3. Install network hooks for logging network communication
+#if ENABLE_NETWORK_HOOK
+            LOGI("[3/3] Installing network hooks...");
             hook_network_methods(handle);
+#else
+            LOGI("[3/3] Network hooks disabled (ENABLE_NETWORK_HOOK=0)");
+#endif
             
             LOGI("==========================================");
             LOGI("All files exported successfully!");
+#if ENABLE_NETWORK_HOOK
+            LOGI("Network hooks installed!");
+#endif
             LOGI("Output directory: %s/files/", game_data_dir);
             LOGI("==========================================");
             

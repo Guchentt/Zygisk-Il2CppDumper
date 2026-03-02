@@ -152,5 +152,3 @@ void dump_script_json(const char *game_data_dir) {
     
     LOGI("Successfully generated script.json: %s", outPath.c_str());
 }
-
-
