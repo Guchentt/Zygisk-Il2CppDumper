@@ -172,107 +172,85 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
         return false;
     }
     
-    // Save original function pointer
-    *original_func = (FuncPtr)target_addr;
-    
-    // Calculate relative offset for branch instruction
-    int64_t offset = (int64_t)hook_func - (int64_t)target_addr;
-    
-    // Check if offset is within range for ARM64 branch instruction
-    // ARM64 branch range: ±128MB
-    if (offset >= -0x8000000 && offset <= 0x7FFFFFF) {
-        // Direct branch is possible
-        // Make memory writable
-        size_t page_size = getpagesize();
-        uintptr_t page_start = (uintptr_t)target_addr & ~(page_size - 1);
-        
-        if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            LOGE("Failed to make memory writable");
-            return false;
-        }
-        
-        // ARM64 branch instruction: B <offset>
-        // Encoding: 0x14 | (offset >> 2) & 0x3FFFFFF
-        uint32_t branch_inst = 0x14000000 | ((offset >> 2) & 0x3FFFFFF);
-        *(uint32_t*)target_addr = branch_inst;
-        
-        // Flush instruction cache
-        __builtin___clear_cache((char*)target_addr, (char*)target_addr + 4);
-        
-        LOGI("Hook installed at %p -> %p (direct, offset: %" PRId64 ")", target_addr, hook_func, offset);
-        return true;
-    } else {
-        // Offset out of range, use trampoline
-        // Try to allocate memory near target function (within ±128MB)
-        size_t page_size = getpagesize();
-        uintptr_t target_page = (uintptr_t)target_addr & ~(page_size - 1);
-        
-        // Try to allocate memory in the same page or nearby
-        void *trampoline = nullptr;
-        for (int i = 0; i < 10; i++) {
-            // Try allocating at different offsets
-            uintptr_t try_addr = target_page + (i * page_size);
-            trampoline = mmap((void*)try_addr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (trampoline != MAP_FAILED) {
-                break;
-            }
-        }
-        
-        if (trampoline == nullptr || trampoline == MAP_FAILED) {
-            // Fallback: allocate anywhere
-            trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        }
-        
-        if (trampoline == nullptr || trampoline == MAP_FAILED) {
-            LOGE("Failed to allocate trampoline memory");
-            return false;
-        }
-        
-        // Calculate offsets
-        int64_t offset_to_trampoline = (int64_t)trampoline - (int64_t)target_addr;
-        int64_t offset_to_hook = (int64_t)hook_func - (int64_t)trampoline;
-        
-        // Check if we can reach trampoline
-        if (offset_to_trampoline < -0x8000000 || offset_to_trampoline > 0x7FFFFFF) {
-            LOGE("Trampoline offset out of range: %" PRId64, offset_to_trampoline);
-            munmap(trampoline, page_size);
-            return false;
-        }
-        
-        // Build trampoline code to jump to hook function
-        // If hook is also out of range from trampoline, use absolute address
-        uint32_t *trampoline_code = (uint32_t*)trampoline;
-        if (offset_to_hook >= -0x8000000 && offset_to_hook <= 0x7FFFFFF) {
-            // Can use relative branch from trampoline
-            trampoline_code[0] = 0x14000000 | ((offset_to_hook >> 2) & 0x3FFFFFF);
-        } else {
-            // Use absolute address: LDR x16, [PC+8]; BR x16; .quad hook_func
-            trampoline_code[0] = 0x58000050; // LDR x16, [PC, #8]
-            trampoline_code[1] = 0xD61F0200; // BR x16
-            *(uint64_t*)(&trampoline_code[2]) = (uint64_t)hook_func;
-            __builtin___clear_cache((char*)trampoline, (char*)trampoline + 16);
-        }
-        
-        // Make target memory writable
-        uintptr_t page_start = (uintptr_t)target_addr & ~(page_size - 1);
-        if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            LOGE("Failed to make memory writable");
-            munmap(trampoline, page_size);
-            return false;
-        }
-        
-        // Write branch to trampoline
-        uint32_t branch_inst = 0x14000000 | ((offset_to_trampoline >> 2) & 0x3FFFFFF);
-        *(uint32_t*)target_addr = branch_inst;
-        
-        // Flush instruction cache
-        __builtin___clear_cache((char*)target_addr, (char*)target_addr + 4);
-        
-        LOGI("Hook installed at %p -> trampoline %p -> hook %p", target_addr, trampoline, hook_func);
-        return true;
+    // Verify target address is executable and aligned
+    if ((uintptr_t)target_addr & 0x3) {
+        LOGE("Target address not 4-byte aligned: %p", target_addr);
+        return false;
     }
+    
+    // Make memory writable
+    size_t page_size = getpagesize();
+    uintptr_t page_start = (uintptr_t)target_addr & ~(page_size - 1);
+    
+    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("Failed to make memory writable");
+        return false;
+    }
+    
+    // Always use trampoline to preserve original function
+    // This is safer than direct branch replacement
+    void *trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    
+    if (trampoline == nullptr || trampoline == MAP_FAILED) {
+        LOGE("Failed to allocate trampoline memory");
+        return false;
+    }
+    
+    // Copy original instructions to trampoline (save at least 16 bytes for safety)
+    // ARM64 instructions are 4 bytes each, so we save 4 instructions
+    uint32_t *target_code = (uint32_t*)target_addr;
+    uint32_t *trampoline_code = (uint32_t*)trampoline;
+    
+    // Save first 4 instructions (16 bytes)
+    for (int i = 0; i < 4; i++) {
+        trampoline_code[i] = target_code[i];
+    }
+    
+    // Calculate offset from trampoline to hook function
+    int64_t offset_to_hook = (int64_t)hook_func - (int64_t)trampoline;
+    
+    // Build trampoline: original instructions + branch to hook
+    if (offset_to_hook >= -0x8000000 && offset_to_hook <= 0x7FFFFFF) {
+        // Use relative branch from trampoline
+        trampoline_code[4] = 0x14000000 | ((offset_to_hook >> 2) & 0x3FFFFFF);
+    } else {
+        // Use absolute address: LDR x16, [PC+8]; BR x16; .quad hook_func
+        trampoline_code[4] = 0x58000050; // LDR x16, [PC, #8]
+        trampoline_code[5] = 0xD61F0200; // BR x16
+        *(uint64_t*)(&trampoline_code[6]) = (uint64_t)hook_func;
+    }
+    
+    // Flush trampoline instruction cache
+    __builtin___clear_cache((char*)trampoline, (char*)trampoline + 32);
+    
+    // Calculate offset from target to trampoline
+    int64_t offset_to_trampoline = (int64_t)trampoline - (int64_t)target_addr;
+    
+    // Check if we can reach trampoline
+    if (offset_to_trampoline < -0x8000000 || offset_to_trampoline > 0x7FFFFFF) {
+        LOGE("Trampoline offset out of range: %" PRId64, offset_to_trampoline);
+        munmap(trampoline, page_size);
+        return false;
+    }
+    
+    // Replace target function with branch to trampoline
+    uint32_t branch_to_trampoline = 0x14000000 | ((offset_to_trampoline >> 2) & 0x3FFFFFF);
+    target_code[0] = branch_to_trampoline;
+    
+    // Fill remaining space with NOPs (optional, for safety)
+    for (int i = 1; i < 4; i++) {
+        target_code[i] = 0xD503201F; // NOP instruction
+    }
+    
+    // Flush target instruction cache
+    __builtin___clear_cache((char*)target_addr, (char*)target_addr + 16);
+    
+    // Save original function pointer (points to trampoline)
+    *original_func = (FuncPtr)trampoline;
+    
+    LOGI("Hook installed at %p -> trampoline %p -> hook %p", target_addr, trampoline, hook_func);
+    return true;
 }
 
 // Hook encrypt function
