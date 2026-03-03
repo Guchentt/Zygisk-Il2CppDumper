@@ -66,9 +66,11 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     
     // Limit logging frequency - only log first few calls and when key changes
     hook_call_count++;
-    if (hook_call_count > 10 && key_logged) {
-        // After logging key once, only log every 100 calls
-        if (hook_call_count % 100 != 0) {
+    
+    // Early return for most calls to minimize overhead
+    if (hook_call_count > 3 && key_logged) {
+        // After logging key once, only log every 1000 calls (reduced frequency)
+        if (hook_call_count % 1000 != 0) {
             return;
         }
     }
@@ -81,7 +83,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
         return;
     }
     
-    // Use signal-safe memory reading
+    // Use signal-safe memory reading with minimal stack usage
     void *struct_ptr = nullptr;
     __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
     
@@ -109,8 +111,8 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     uint8_t *key_array_base = (uint8_t*)key_array_ptr;
     __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
     
-    // Validate key length
-    if (key_length == 0 || key_length > 1024) {
+    // Validate key length (strict limit to prevent stack overflow)
+    if (key_length == 0 || key_length > 128) {  // Reduced from 1024 to 128
         if (hook_call_count <= 3) {
             LOGW("[*] Invalid key length: %u", key_length);
         }
@@ -137,29 +139,34 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     }
     
     // Only log detailed info for first few calls or periodically
-    if (hook_call_count <= 3 || (hook_call_count % 100 == 0)) {
+    if (hook_call_count <= 3 || (hook_call_count % 1000 == 0)) {
         LOGI("[*] Encrypt function called #%u", hook_call_count);
         LOGI("[*] arg0: %p, struct_ptr: %p, key_array: %p, length: %u", 
              arg0, struct_ptr, key_array_ptr, key_length);
     }
     
     // Read key data only when we need to log it
-    if (!key_logged || hook_call_count % 100 == 0) {
-        // Use stack buffer for small keys to avoid heap allocation
-        uint8_t key_buffer[256];
-        uint8_t *key_data = (key_length <= 256) ? key_buffer : new uint8_t[key_length];
-        
-        __builtin_memcpy(key_data, key_data_ptr, key_length);
-        
-        // Convert to hex string
-        std::string key_hex = bytes_to_hex(key_data, key_length);
-        LOGI("[*] Key (hex): %s", key_hex.c_str());
-        LOGI("[*] Key: %s", key_hex.c_str());
-        
-        key_logged = true;
-        
-        if (key_length > 256) {
-            delete[] key_data;
+    // Use smaller stack buffer to prevent stack overflow
+    if (!key_logged || hook_call_count % 1000 == 0) {
+        // Use small stack buffer (128 bytes max) to prevent stack overflow
+        uint8_t key_buffer[128];
+        if (key_length <= 128) {
+            __builtin_memcpy(key_buffer, key_data_ptr, key_length);
+            
+            // Convert to hex string (minimal stack usage)
+            char hex_str[257];  // 128*2 + 1 for null terminator
+            for (uint32_t i = 0; i < key_length && i < 128; i++) {
+                snprintf(hex_str + (i * 2), 3, "%02x", key_buffer[i]);
+            }
+            hex_str[key_length * 2] = '\0';
+            
+            LOGI("[*] Key (hex): %s", hex_str);
+            LOGI("[*] Key: %s", hex_str);
+            
+            key_logged = true;
+        } else {
+            // For larger keys, use heap allocation but log warning
+            LOGW("[*] Key too large (%u bytes), skipping hex conversion", key_length);
         }
     }
 }
@@ -178,24 +185,24 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
         return false;
     }
     
-    // Make memory writable
-    size_t page_size = getpagesize();
-    uintptr_t page_start = (uintptr_t)target_addr & ~(page_size - 1);
-    
-    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("Failed to make memory writable");
-        return false;
-    }
-    
+        // Make memory writable
+        size_t page_size = getpagesize();
+        uintptr_t page_start = (uintptr_t)target_addr & ~(page_size - 1);
+        
+        if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            LOGE("Failed to make memory writable");
+            return false;
+        }
+        
     // Always use trampoline to preserve original function
     // This is safer than direct branch replacement
     // Try to allocate trampoline near target function (within ±128MB)
-    uintptr_t target_page = (uintptr_t)target_addr & ~(page_size - 1);
+        uintptr_t target_page = (uintptr_t)target_addr & ~(page_size - 1);
     void *trampoline = nullptr;
     
     // Try allocating near target function first (within ±128MB range)
     for (int i = -100; i <= 100; i++) {
-        uintptr_t try_addr = target_page + (i * page_size);
+            uintptr_t try_addr = target_page + (i * page_size);
         // Check if within ±128MB range
         int64_t offset = (int64_t)try_addr - (int64_t)target_addr;
         if (offset >= -0x8000000 && offset <= 0x7FFFFFF) {
@@ -204,20 +211,20 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
             if (trampoline != MAP_FAILED) {
                 break;
             }
+            }
         }
-    }
-    
+        
     // If near allocation failed, try allocating anywhere
-    if (trampoline == nullptr || trampoline == MAP_FAILED) {
-        trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-    
-    if (trampoline == nullptr || trampoline == MAP_FAILED) {
-        LOGE("Failed to allocate trampoline memory");
-        return false;
-    }
-    
+        if (trampoline == nullptr || trampoline == MAP_FAILED) {
+            trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        }
+        
+        if (trampoline == nullptr || trampoline == MAP_FAILED) {
+            LOGE("Failed to allocate trampoline memory");
+            return false;
+        }
+        
     // Copy original instructions to trampoline (save at least 16 bytes for safety)
     // ARM64 instructions are 4 bytes each, so we save 4 instructions
     uint32_t *target_code = (uint32_t*)target_addr;
@@ -232,11 +239,11 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     int64_t offset_to_hook = (int64_t)hook_func - (int64_t)trampoline;
     
     // Build trampoline: original instructions + branch to hook
-    if (offset_to_hook >= -0x8000000 && offset_to_hook <= 0x7FFFFFF) {
+        if (offset_to_hook >= -0x8000000 && offset_to_hook <= 0x7FFFFFF) {
         // Use relative branch from trampoline
         trampoline_code[4] = 0x14000000 | ((offset_to_hook >> 2) & 0x3FFFFFF);
-    } else {
-        // Use absolute address: LDR x16, [PC+8]; BR x16; .quad hook_func
+        } else {
+            // Use absolute address: LDR x16, [PC+8]; BR x16; .quad hook_func
         trampoline_code[4] = 0x58000050; // LDR x16, [PC, #8]
         trampoline_code[5] = 0xD61F0200; // BR x16
         *(uint64_t*)(&trampoline_code[6]) = (uint64_t)hook_func;
@@ -274,9 +281,9 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     
     // Save original function pointer (points to trampoline)
     *original_func = (FuncPtr)trampoline;
-    
-    LOGI("Hook installed at %p -> trampoline %p -> hook %p", target_addr, trampoline, hook_func);
-    return true;
+        
+        LOGI("Hook installed at %p -> trampoline %p -> hook %p", target_addr, trampoline, hook_func);
+        return true;
 }
 
 // Hook encrypt function
