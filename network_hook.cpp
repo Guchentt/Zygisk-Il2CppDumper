@@ -51,116 +51,89 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     LOGI("[*] Encrypt function called");
     LOGI("[*] arg0: %p", arg0);
     
+    // Always call original function first to avoid blocking
+    if (Encrypt_Function_Original) {
+        Encrypt_Function_Original(arg0);
+    }
+    
+    // Then try to read key data (non-blocking)
     if (!arg0) {
         LOGW("[*] arg0 is null, skipping");
-        if (Encrypt_Function_Original) {
-            Encrypt_Function_Original(arg0);
-        }
         return;
     }
     
     // Check if memory is readable
     if ((uintptr_t)arg0 < 0x1000 || (uintptr_t)arg0 > 0x7FFFFFFFFFFFFFFF) {
         LOGW("[*] arg0 has invalid address: %p", arg0);
-        if (Encrypt_Function_Original) {
-            Encrypt_Function_Original(arg0);
-        }
         return;
     }
     
-    try {
-        // Read struct pointer from args[0]
-        void *struct_ptr = nullptr;
-        __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
-        LOGI("[*] struct_ptr: %p", struct_ptr);
-        
-        if (!struct_ptr) {
-            LOGW("[*] struct_ptr is null");
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Check struct_ptr validity
-        if ((uintptr_t)struct_ptr < 0x1000 || (uintptr_t)struct_ptr > 0x7FFFFFFFFFFFFFFF) {
-            LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Read key array pointer from struct_ptr + 0xB8
-        void *key_array_ptr = nullptr;
-        uint8_t *struct_base = (uint8_t*)struct_ptr;
-        __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
-        LOGI("[*] Key array address: %p", key_array_ptr);
-        
-        if (!key_array_ptr) {
-            LOGW("[*] key_array_ptr is null");
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Check key_array_ptr validity
-        if ((uintptr_t)key_array_ptr < 0x1000 || (uintptr_t)key_array_ptr > 0x7FFFFFFFFFFFFFFF) {
-            LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Read key length from key_array_ptr + 24
-        uint32_t key_length = 0;
-        uint8_t *key_array_base = (uint8_t*)key_array_ptr;
-        __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
-        LOGI("[*] Key length: %u", key_length);
-        
-        // Validate key length
-        if (key_length == 0 || key_length > 1024) {
-            LOGW("[*] Invalid key length: %u", key_length);
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Read key data from key_array_ptr + 32
-        uint8_t *key_data_ptr = key_array_base + 32;
-        
-        // Check if we can safely read the key data
-        if ((uintptr_t)key_data_ptr < 0x1000 || 
-            (uintptr_t)key_data_ptr > 0x7FFFFFFFFFFFFFFF ||
-            (uintptr_t)(key_data_ptr + key_length) > 0x7FFFFFFFFFFFFFFF) {
-            LOGW("[*] Key data pointer out of bounds");
-            if (Encrypt_Function_Original) {
-                Encrypt_Function_Original(arg0);
-            }
-            return;
-        }
-        
-        // Read key data
-        uint8_t *key_data = new uint8_t[key_length];
-        __builtin_memcpy(key_data, key_data_ptr, key_length);
-        
-        // Convert to hex string
-        std::string key_hex = bytes_to_hex(key_data, key_length);
-        LOGI("[*] Key (hex): %s", key_hex.c_str());
-        LOGI("[*] Key: %s", key_hex.c_str());
-        
-        delete[] key_data;
-    } catch (...) {
-        LOGE("[*] Exception occurred while reading key data");
+    // Use signal-safe memory reading
+    void *struct_ptr = nullptr;
+    __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
+    LOGI("[*] struct_ptr: %p", struct_ptr);
+    
+    if (!struct_ptr) {
+        LOGW("[*] struct_ptr is null");
+        return;
     }
     
-    // Call original function
-    if (Encrypt_Function_Original) {
-        Encrypt_Function_Original(arg0);
+    // Check struct_ptr validity
+    if ((uintptr_t)struct_ptr < 0x1000 || (uintptr_t)struct_ptr > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
+        return;
     }
+    
+    // Read key array pointer from struct_ptr + 0xB8
+    void *key_array_ptr = nullptr;
+    uint8_t *struct_base = (uint8_t*)struct_ptr;
+    __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
+    LOGI("[*] Key array address: %p", key_array_ptr);
+    
+    if (!key_array_ptr) {
+        LOGW("[*] key_array_ptr is null");
+        return;
+    }
+    
+    // Check key_array_ptr validity
+    if ((uintptr_t)key_array_ptr < 0x1000 || (uintptr_t)key_array_ptr > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
+        return;
+    }
+    
+    // Read key length from key_array_ptr + 24
+    uint32_t key_length = 0;
+    uint8_t *key_array_base = (uint8_t*)key_array_ptr;
+    __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
+    LOGI("[*] Key length: %u", key_length);
+    
+    // Validate key length
+    if (key_length == 0 || key_length > 1024) {
+        LOGW("[*] Invalid key length: %u", key_length);
+        return;
+    }
+    
+    // Read key data from key_array_ptr + 32
+    uint8_t *key_data_ptr = key_array_base + 32;
+    
+    // Check if we can safely read the key data
+    if ((uintptr_t)key_data_ptr < 0x1000 || 
+        (uintptr_t)key_data_ptr > 0x7FFFFFFFFFFFFFFF ||
+        (uintptr_t)(key_data_ptr + key_length) > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] Key data pointer out of bounds");
+        return;
+    }
+    
+    // Read key data
+    uint8_t *key_data = new uint8_t[key_length];
+    __builtin_memcpy(key_data, key_data_ptr, key_length);
+    
+    // Convert to hex string
+    std::string key_hex = bytes_to_hex(key_data, key_length);
+    LOGI("[*] Key (hex): %s", key_hex.c_str());
+    LOGI("[*] Key: %s", key_hex.c_str());
+    
+    delete[] key_data;
 }
 
 // Install function hook using inline hook with trampoline
