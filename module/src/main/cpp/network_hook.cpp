@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cinttypes>
+#include <inttypes.h>  // For PRIxPTR and SCNxPTR macros
 #include <cstdio>
 #include <string>
 #include <fstream>
@@ -67,7 +68,8 @@ static bool is_memory_executable(void *addr) {
         uintptr_t start, end;
         char perms[5];
         
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
+        // Use %x for uintptr_t (works for both 32-bit and 64-bit)
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, perms) == 3) {
             if (target >= start && target < end) {
                 executable = (perms[2] == 'x');  // 检查执行权限
                 break;
@@ -96,7 +98,8 @@ static void debug_memory_permissions(void *addr, const char *name) {
         char path[256] = "";
         
         // 解析 maps 行
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) >= 3) {
+        // Use SCNxPTR for uintptr_t (works for both 32-bit and 64-bit)
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, perms) >= 3) {
             // 尝试读取路径
             char *path_start = strchr(line, '/');
             if (path_start) {
@@ -105,7 +108,7 @@ static void debug_memory_permissions(void *addr, const char *name) {
             }
             
             if (target >= start && target < end) {
-                LOGI("  Range: 0x%lx-0x%lx Perms: %s Path: %s", 
+                LOGI("  Range: 0x%" PRIxPTR "-0x%" PRIxPTR " Perms: %s Path: %s", 
                      start, end, perms, path[0] ? path : "[anonymous]");
                 found = true;
                 break;
@@ -203,7 +206,7 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     size_t page_size = getpagesize();
     uintptr_t target_page_start = (uintptr_t)target_addr & ~(page_size - 1);
     
-    LOGI("Page size: %zu, Target page start: 0x%lx", page_size, target_page_start);
+    LOGI("Page size: %zu, Target page start: 0x%" PRIxPTR, page_size, target_page_start);
     
     // Make target memory writable
     if (mprotect((void*)target_page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -261,7 +264,7 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     uintptr_t trampoline_jump_addr = (uintptr_t)trampoline + 16;  // 4条指令后
     int64_t offset_to_return = (int64_t)return_addr - (int64_t)trampoline_jump_addr;
     
-    LOGI("Trampoline jump from 0x%lx to %p, offset: %" PRId64, 
+    LOGI("Trampoline jump from 0x%" PRIxPTR " to %p, offset: %" PRId64, 
          trampoline_jump_addr, return_addr, offset_to_return);
     
     if (offset_to_return >= -0x8000000 && offset_to_return <= 0x7FFFFFF) {
@@ -280,7 +283,7 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     
     uintptr_t trampoline_page = (uintptr_t)trampoline & ~(page_size - 1);
     
-    LOGI("Setting trampoline memory to executable (page: 0x%lx)", trampoline_page);
+    LOGI("Setting trampoline memory to executable (page: 0x%" PRIxPTR ")", trampoline_page);
     
     // 首先确保是读写权限
     if (mprotect((void*)trampoline_page, page_size, PROT_READ | PROT_WRITE) != 0) {
