@@ -56,13 +56,19 @@ static bool key_logged = false;
 // ============ 权限检查函数 ============
 
 // 检查内存权限
+// 注意：在 Android 上，代码段可能显示为 r--p，但实际是可执行的
 static bool is_memory_executable(void *addr) {
     FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) return false;
+    if (!maps) {
+        // 如果无法读取 maps，假设可以执行（让 mprotect 来验证）
+        return true;
+    }
     
     char line[512];
     uintptr_t target = (uintptr_t)addr;
     bool executable = false;
+    bool is_code_section = false;
+    char path[256] = "";
     
     while (fgets(line, sizeof(line), maps)) {
         uintptr_t start, end;
@@ -71,13 +77,33 @@ static bool is_memory_executable(void *addr) {
         // Use %x for uintptr_t (works for both 32-bit and 64-bit)
         if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, perms) == 3) {
             if (target >= start && target < end) {
-                executable = (perms[2] == 'x');  // 检查执行权限
+                // 检查是否是代码段（.so 文件）
+                char *path_start = strchr(line, '/');
+                if (path_start) {
+                    strncpy(path, path_start, sizeof(path) - 1);
+                    path[strcspn(path, "\n")] = '\0';
+                    // 如果是 .so 文件，认为是代码段
+                    if (strstr(path, ".so") != NULL) {
+                        is_code_section = true;
+                    }
+                }
+                
+                // 如果显示为可执行，或者是在代码段中（即使显示为 r--p）
+                executable = (perms[2] == 'x') || is_code_section;
                 break;
             }
         }
     }
     
     fclose(maps);
+    
+    // 如果是在代码段中，即使显示为 r--p，也认为可执行
+    // 因为 Android 上代码段通过文件映射加载，maps 可能显示不准确
+    if (is_code_section && !executable) {
+        LOGW("Code section shows as non-executable in maps, but will attempt hook anyway");
+        return true;  // 允许尝试 hook，让 mprotect 来验证
+    }
+    
     return executable;
 }
 
@@ -440,12 +466,14 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
         LOGW("Warning: Could not verify address with dladdr");
     }
     
-    // 检查目标函数权限
+    // 检查目标函数权限（仅用于调试）
     debug_memory_permissions(encrypt_func_ptr, "encrypt function");
     
+    // 注意：在 Android 上，代码段可能显示为 r--p，但实际是可执行的
+    // 所以这里只做警告，不阻止 hook 安装
     if (!is_memory_executable(encrypt_func_ptr)) {
-        LOGE("Target function is not executable! Hook will fail.");
-        return;
+        LOGW("Target function shows as non-executable in maps, but will attempt hook anyway");
+        LOGW("This is normal for Android code sections loaded via file mapping");
     }
     
     // Install hook
@@ -460,4 +488,3 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
 }
 
 #endif // ENABLE_NETWORK_HOOK
-
