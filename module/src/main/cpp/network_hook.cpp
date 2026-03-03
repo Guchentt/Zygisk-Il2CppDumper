@@ -193,6 +193,12 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
         return false;
     }
     
+    // 检查架构：此 hook 实现主要针对 ARM/ARM64
+#if !defined(__aarch64__) && !defined(__arm__)
+    LOGW("Warning: This hook implementation is designed for ARM/ARM64. "
+         "It may not work correctly on other architectures.");
+#endif
+    
     LOGI("Installing hook: target=%p, hook=%p", target_addr, hook_func);
     debug_memory_permissions(target_addr, "target function");
     
@@ -319,8 +325,17 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     // 清除指令缓存
     __builtin___clear_cache((char*)trampoline, (char*)trampoline + page_size);
     
-    // ARM 内存屏障
+    // 内存屏障（架构特定）
+#if defined(__aarch64__) || defined(__arm__)
+    // ARM/ARM64: 使用 ARM 内存屏障指令
     asm volatile("dsb sy\nisb sy\n" : : : "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+    // x86/x86_64: 使用 x86 内存屏障指令
+    asm volatile("mfence" : : : "memory");
+#else
+    // 其他架构: 使用编译器内置的内存屏障
+    __sync_synchronize();
+#endif
     
     debug_memory_permissions(trampoline, "trampoline (after setup)");
     
@@ -349,7 +364,18 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     
     // 清除目标函数缓存
     __builtin___clear_cache((char*)target_addr, (char*)target_addr + 16);
+    
+    // 内存屏障（架构特定）
+#if defined(__aarch64__) || defined(__arm__)
+    // ARM/ARM64: 使用 ARM 内存屏障指令
     asm volatile("dsb sy\nisb sy\n" : : : "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+    // x86/x86_64: 使用 x86 内存屏障指令
+    asm volatile("mfence" : : : "memory");
+#else
+    // 其他架构: 使用编译器内置的内存屏障
+    __sync_synchronize();
+#endif
     
     LOGI("Target function patched");
     
