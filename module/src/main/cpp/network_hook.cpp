@@ -64,22 +64,18 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
         Encrypt_Function_Original(arg0);
     }
     
-    // Limit logging frequency - only log first few calls and when key changes
+    // Limit logging frequency - only log first few calls
     hook_call_count++;
     
-    // Early return for most calls to minimize overhead
-    if (hook_call_count > 3 && key_logged) {
-        // After logging key once, only log every 1000 calls (reduced frequency)
-        if (hook_call_count % 1000 != 0) {
-            return;
-        }
+    // Early return for most calls to minimize overhead and prevent stack overflow
+    // Only process first 3 calls to capture the key, then disable hook processing
+    if (hook_call_count > 3) {
+        return;  // Stop processing after first 3 calls to prevent stack issues
     }
     
     // Then try to read key data (non-blocking)
     if (!IS_VALID_PTR(arg0)) {
-        if (hook_call_count <= 3) {
-            LOGW("[*] arg0 has invalid address: %p", arg0);
-        }
+        LOGW("[*] arg0 has invalid address: %p", arg0);
         return;
     }
     
@@ -88,9 +84,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
     
     if (!IS_VALID_PTR(struct_ptr)) {
-        if (hook_call_count <= 3) {
-            LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
-        }
+        LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
         return;
     }
     
@@ -100,9 +94,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
     
     if (!IS_VALID_PTR(key_array_ptr)) {
-        if (hook_call_count <= 3) {
-            LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
-        }
+        LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
         return;
     }
     
@@ -112,10 +104,8 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
     
     // Validate key length (strict limit to prevent stack overflow)
-    if (key_length == 0 || key_length > 128) {  // Reduced from 1024 to 128
-        if (hook_call_count <= 3) {
-            LOGW("[*] Invalid key length: %u", key_length);
-        }
+    if (key_length == 0 || key_length > 64) {  // Further reduced to 64 bytes
+        LOGW("[*] Invalid key length: %u", key_length);
         return;
     }
     
@@ -124,50 +114,40 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     
     // Check if we can safely read the key data
     if (!IS_VALID_PTR(key_data_ptr)) {
-        if (hook_call_count <= 3) {
-            LOGW("[*] Key data pointer out of bounds");
-        }
+        LOGW("[*] Key data pointer out of bounds");
         return;
     }
     
     // Check if key_data_ptr + key_length would overflow
     if ((uintptr_t)key_data_ptr + key_length < (uintptr_t)key_data_ptr) {
-        if (hook_call_count <= 3) {
-            LOGW("[*] Key data pointer addition would overflow");
-        }
+        LOGW("[*] Key data pointer addition would overflow");
         return;
     }
     
-    // Only log detailed info for first few calls or periodically
-    if (hook_call_count <= 3 || (hook_call_count % 1000 == 0)) {
-        LOGI("[*] Encrypt function called #%u", hook_call_count);
-        LOGI("[*] arg0: %p, struct_ptr: %p, key_array: %p, length: %u", 
-             arg0, struct_ptr, key_array_ptr, key_length);
-    }
+    // Log basic info
+    LOGI("[*] Encrypt function called #%u", hook_call_count);
+    LOGI("[*] arg0: %p, struct_ptr: %p, key_array: %p, length: %u", 
+         arg0, struct_ptr, key_array_ptr, key_length);
     
-    // Read key data only when we need to log it
-    // Use smaller stack buffer to prevent stack overflow
-    if (!key_logged || hook_call_count % 1000 == 0) {
-        // Use small stack buffer (128 bytes max) to prevent stack overflow
-        uint8_t key_buffer[128];
-        if (key_length <= 128) {
-            __builtin_memcpy(key_buffer, key_data_ptr, key_length);
-            
-            // Convert to hex string (minimal stack usage)
-            char hex_str[257];  // 128*2 + 1 for null terminator
-            for (uint32_t i = 0; i < key_length && i < 128; i++) {
-                snprintf(hex_str + (i * 2), 3, "%02x", key_buffer[i]);
-            }
-            hex_str[key_length * 2] = '\0';
-            
-            LOGI("[*] Key (hex): %s", hex_str);
-            LOGI("[*] Key: %s", hex_str);
-            
-            key_logged = true;
-        } else {
-            // For larger keys, use heap allocation but log warning
-            LOGW("[*] Key too large (%u bytes), skipping hex conversion", key_length);
+    // Read key data - use minimal stack buffer (64 bytes max)
+    uint8_t key_buffer[64];
+    if (key_length <= 64) {
+        __builtin_memcpy(key_buffer, key_data_ptr, key_length);
+        
+        // Convert to hex string (minimal stack usage - 129 bytes total)
+        char hex_str[129];  // 64*2 + 1 for null terminator
+        for (uint32_t i = 0; i < key_length && i < 64; i++) {
+            hex_str[i * 2] = "0123456789abcdef"[(key_buffer[i] >> 4) & 0xF];
+            hex_str[i * 2 + 1] = "0123456789abcdef"[key_buffer[i] & 0xF];
         }
+        hex_str[key_length * 2] = '\0';
+        
+        LOGI("[*] Key (hex): %s", hex_str);
+        LOGI("[*] Key: %s", hex_str);
+        
+        key_logged = true;
+    } else {
+        LOGW("[*] Key too large (%u bytes), skipping hex conversion", key_length);
     }
 }
 
@@ -342,3 +322,5 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
 }
 
 #endif // ENABLE_NETWORK_HOOK
+
+
