@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <iomanip>
 
+// External il2cpp base address (set in il2cpp_dump.cpp)
+extern uint64_t il2cpp_base;
+
 #if !ENABLE_NETWORK_HOOK
 // Hook disabled, provide empty implementation
 void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
@@ -256,16 +259,13 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
         return;
     }
     
-    // Get libil2cpp.so base address from handle
-    Dl_info dlInfo;
-    uint64_t target_base = 0;
+    // Use the global il2cpp_base variable that was set in il2cpp_dump.cpp
+    uint64_t target_base = il2cpp_base;
     
-    // Try to get base address using dladdr on the handle
-    if (dladdr(il2cpp_handle, &dlInfo)) {
-        target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        LOGI("Found libil2cpp.so base: 0x%" PRIx64, target_base);
-    } else {
+    if (target_base == 0) {
+        LOGE("il2cpp_base is not set yet, trying to get base address...");
         // Fallback: try to get base from any symbol in the handle
+        Dl_info dlInfo;
         void *sym = dlsym(il2cpp_handle, "il2cpp_init");
         if (sym && dladdr(sym, &dlInfo)) {
             target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
@@ -274,11 +274,8 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
             LOGE("Failed to get libil2cpp.so base address");
             return;
         }
-    }
-    
-    if (target_base == 0) {
-        LOGE("Failed to find libil2cpp.so base address");
-        return;
+    } else {
+        LOGI("Using il2cpp_base: 0x%" PRIx64, target_base);
     }
     
     // Calculate encrypt function address: base + offset
