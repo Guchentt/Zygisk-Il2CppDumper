@@ -16,6 +16,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <iomanip>
+#include <climits>
+
+// External il2cpp base address (set in il2cpp_dump.cpp)
+extern uint64_t il2cpp_base;
+
+// Helper macro to check if pointer is valid (within reasonable range)
+#define IS_VALID_PTR(ptr) ((ptr) != nullptr && (uintptr_t)(ptr) >= 0x1000 && (uintptr_t)(ptr) < UINTPTR_MAX)
 
 #if !ENABLE_NETWORK_HOOK
 // Hook disabled, provide empty implementation
@@ -57,13 +64,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     }
     
     // Then try to read key data (non-blocking)
-    if (!arg0) {
-        LOGW("[*] arg0 is null, skipping");
-        return;
-    }
-    
-    // Check if memory is readable
-    if ((uintptr_t)arg0 < 0x1000 || (uintptr_t)arg0 > 0x7FFFFFFFFFFFFFFF) {
+    if (!IS_VALID_PTR(arg0)) {
         LOGW("[*] arg0 has invalid address: %p", arg0);
         return;
     }
@@ -73,13 +74,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
     LOGI("[*] struct_ptr: %p", struct_ptr);
     
-    if (!struct_ptr) {
-        LOGW("[*] struct_ptr is null");
-        return;
-    }
-    
-    // Check struct_ptr validity
-    if ((uintptr_t)struct_ptr < 0x1000 || (uintptr_t)struct_ptr > 0x7FFFFFFFFFFFFFFF) {
+    if (!IS_VALID_PTR(struct_ptr)) {
         LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
         return;
     }
@@ -90,13 +85,7 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
     LOGI("[*] Key array address: %p", key_array_ptr);
     
-    if (!key_array_ptr) {
-        LOGW("[*] key_array_ptr is null");
-        return;
-    }
-    
-    // Check key_array_ptr validity
-    if ((uintptr_t)key_array_ptr < 0x1000 || (uintptr_t)key_array_ptr > 0x7FFFFFFFFFFFFFFF) {
+    if (!IS_VALID_PTR(key_array_ptr)) {
         LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
         return;
     }
@@ -117,10 +106,14 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     uint8_t *key_data_ptr = key_array_base + 32;
     
     // Check if we can safely read the key data
-    if ((uintptr_t)key_data_ptr < 0x1000 || 
-        (uintptr_t)key_data_ptr > 0x7FFFFFFFFFFFFFFF ||
-        (uintptr_t)(key_data_ptr + key_length) > 0x7FFFFFFFFFFFFFFF) {
+    if (!IS_VALID_PTR(key_data_ptr)) {
         LOGW("[*] Key data pointer out of bounds");
+        return;
+    }
+    
+    // Check if key_data_ptr + key_length would overflow
+    if ((uintptr_t)key_data_ptr + key_length < (uintptr_t)key_data_ptr) {
+        LOGW("[*] Key data pointer addition would overflow");
         return;
     }
     
@@ -256,16 +249,13 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
         return;
     }
     
-    // Get libil2cpp.so base address from handle
-    Dl_info dlInfo;
-    uint64_t target_base = 0;
+    // Use the global il2cpp_base variable that was set in il2cpp_dump.cpp
+    uint64_t target_base = il2cpp_base;
     
-    // Try to get base address using dladdr on the handle
-    if (dladdr(il2cpp_handle, &dlInfo)) {
-        target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        LOGI("Found libil2cpp.so base: 0x%" PRIx64, target_base);
-    } else {
+    if (target_base == 0) {
+        LOGE("il2cpp_base is not set yet, trying to get base address...");
         // Fallback: try to get base from any symbol in the handle
+        Dl_info dlInfo;
         void *sym = dlsym(il2cpp_handle, "il2cpp_init");
         if (sym && dladdr(sym, &dlInfo)) {
             target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
@@ -274,11 +264,8 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
             LOGE("Failed to get libil2cpp.so base address");
             return;
         }
-    }
-    
-    if (target_base == 0) {
-        LOGE("Failed to find libil2cpp.so base address");
-        return;
+    } else {
+        LOGI("Using il2cpp_base: 0x%" PRIx64, target_base);
     }
     
     // Calculate encrypt function address: base + offset
