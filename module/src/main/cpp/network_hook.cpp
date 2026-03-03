@@ -16,9 +16,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <iomanip>
+#include <climits>
 
 // External il2cpp base address (set in il2cpp_dump.cpp)
 extern uint64_t il2cpp_base;
+
+// Helper macro to check if pointer is valid (within reasonable range)
+#define IS_VALID_PTR(ptr) ((ptr) != nullptr && (uintptr_t)(ptr) >= 0x1000 && (uintptr_t)(ptr) < UINTPTR_MAX)
 
 #if !ENABLE_NETWORK_HOOK
 // Hook disabled, provide empty implementation
@@ -43,6 +47,10 @@ static std::string bytes_to_hex(const uint8_t *data, size_t length) {
     return ss.str();
 }
 
+// Static counter to limit logging frequency
+static uint32_t hook_call_count = 0;
+static bool key_logged = false;
+
 // Hook wrapper for encrypt function
 // Based on Frida script logic:
 // - args[0] is the first parameter
@@ -51,39 +59,36 @@ static std::string bytes_to_hex(const uint8_t *data, size_t length) {
 // - Read U32 from key_array_ptr + 24 -> key_length
 // - Read ByteArray from key_array_ptr + 32 -> key_data
 static void Encrypt_Function_Hook_Wrapper(void *arg0) {
-    LOGI("[*] Encrypt function called");
-    LOGI("[*] arg0: %p", arg0);
-    
     // Always call original function first to avoid blocking
     if (Encrypt_Function_Original) {
         Encrypt_Function_Original(arg0);
     }
     
-    // Then try to read key data (non-blocking)
-    if (!arg0) {
-        LOGW("[*] arg0 is null, skipping");
-        return;
+    // Limit logging frequency - only log first few calls and when key changes
+    hook_call_count++;
+    if (hook_call_count > 10 && key_logged) {
+        // After logging key once, only log every 100 calls
+        if (hook_call_count % 100 != 0) {
+            return;
+        }
     }
     
-    // Check if memory is readable
-    if ((uintptr_t)arg0 < 0x1000 || (uintptr_t)arg0 > 0x7FFFFFFFFFFFFFFF) {
-        LOGW("[*] arg0 has invalid address: %p", arg0);
+    // Then try to read key data (non-blocking)
+    if (!IS_VALID_PTR(arg0)) {
+        if (hook_call_count <= 3) {
+            LOGW("[*] arg0 has invalid address: %p", arg0);
+        }
         return;
     }
     
     // Use signal-safe memory reading
     void *struct_ptr = nullptr;
     __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
-    LOGI("[*] struct_ptr: %p", struct_ptr);
     
-    if (!struct_ptr) {
-        LOGW("[*] struct_ptr is null");
-        return;
-    }
-    
-    // Check struct_ptr validity
-    if ((uintptr_t)struct_ptr < 0x1000 || (uintptr_t)struct_ptr > 0x7FFFFFFFFFFFFFFF) {
-        LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
+    if (!IS_VALID_PTR(struct_ptr)) {
+        if (hook_call_count <= 3) {
+            LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
+        }
         return;
     }
     
@@ -91,16 +96,11 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     void *key_array_ptr = nullptr;
     uint8_t *struct_base = (uint8_t*)struct_ptr;
     __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
-    LOGI("[*] Key array address: %p", key_array_ptr);
     
-    if (!key_array_ptr) {
-        LOGW("[*] key_array_ptr is null");
-        return;
-    }
-    
-    // Check key_array_ptr validity
-    if ((uintptr_t)key_array_ptr < 0x1000 || (uintptr_t)key_array_ptr > 0x7FFFFFFFFFFFFFFF) {
-        LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
+    if (!IS_VALID_PTR(key_array_ptr)) {
+        if (hook_call_count <= 3) {
+            LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
+        }
         return;
     }
     
@@ -108,11 +108,12 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     uint32_t key_length = 0;
     uint8_t *key_array_base = (uint8_t*)key_array_ptr;
     __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
-    LOGI("[*] Key length: %u", key_length);
     
     // Validate key length
     if (key_length == 0 || key_length > 1024) {
-        LOGW("[*] Invalid key length: %u", key_length);
+        if (hook_call_count <= 3) {
+            LOGW("[*] Invalid key length: %u", key_length);
+        }
         return;
     }
     
@@ -120,23 +121,47 @@ static void Encrypt_Function_Hook_Wrapper(void *arg0) {
     uint8_t *key_data_ptr = key_array_base + 32;
     
     // Check if we can safely read the key data
-    if ((uintptr_t)key_data_ptr < 0x1000 || 
-        (uintptr_t)key_data_ptr > 0x7FFFFFFFFFFFFFFF ||
-        (uintptr_t)(key_data_ptr + key_length) > 0x7FFFFFFFFFFFFFFF) {
-        LOGW("[*] Key data pointer out of bounds");
+    if (!IS_VALID_PTR(key_data_ptr)) {
+        if (hook_call_count <= 3) {
+            LOGW("[*] Key data pointer out of bounds");
+        }
         return;
     }
     
-    // Read key data
-    uint8_t *key_data = new uint8_t[key_length];
-    __builtin_memcpy(key_data, key_data_ptr, key_length);
+    // Check if key_data_ptr + key_length would overflow
+    if ((uintptr_t)key_data_ptr + key_length < (uintptr_t)key_data_ptr) {
+        if (hook_call_count <= 3) {
+            LOGW("[*] Key data pointer addition would overflow");
+        }
+        return;
+    }
     
-    // Convert to hex string
-    std::string key_hex = bytes_to_hex(key_data, key_length);
-    LOGI("[*] Key (hex): %s", key_hex.c_str());
-    LOGI("[*] Key: %s", key_hex.c_str());
+    // Only log detailed info for first few calls or periodically
+    if (hook_call_count <= 3 || (hook_call_count % 100 == 0)) {
+        LOGI("[*] Encrypt function called #%u", hook_call_count);
+        LOGI("[*] arg0: %p, struct_ptr: %p, key_array: %p, length: %u", 
+             arg0, struct_ptr, key_array_ptr, key_length);
+    }
     
-    delete[] key_data;
+    // Read key data only when we need to log it
+    if (!key_logged || hook_call_count % 100 == 0) {
+        // Use stack buffer for small keys to avoid heap allocation
+        uint8_t key_buffer[256];
+        uint8_t *key_data = (key_length <= 256) ? key_buffer : new uint8_t[key_length];
+        
+        __builtin_memcpy(key_data, key_data_ptr, key_length);
+        
+        // Convert to hex string
+        std::string key_hex = bytes_to_hex(key_data, key_length);
+        LOGI("[*] Key (hex): %s", key_hex.c_str());
+        LOGI("[*] Key: %s", key_hex.c_str());
+        
+        key_logged = true;
+        
+        if (key_length > 256) {
+            delete[] key_data;
+        }
+    }
 }
 
 // Install function hook using inline hook with trampoline
@@ -294,10 +319,7 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
         LOGW("Warning: Could not verify address with dladdr");
     }
     
-    // Wait a bit for module to be fully loaded
-    sleep(2);
-    
-    // Install hook
+    // Install hook immediately (no need to wait)
     LOGI("Installing hook at %p", encrypt_func_ptr);
     if (install_hook(encrypt_func_ptr, (void*)Encrypt_Function_Hook_Wrapper, &Encrypt_Function_Original)) {
         LOGI("✓ Encrypt function hooked successfully");
