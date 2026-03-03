@@ -189,8 +189,29 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     
     // Always use trampoline to preserve original function
     // This is safer than direct branch replacement
-    void *trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Try to allocate trampoline near target function (within ±128MB)
+    uintptr_t target_page = (uintptr_t)target_addr & ~(page_size - 1);
+    void *trampoline = nullptr;
+    
+    // Try allocating near target function first (within ±128MB range)
+    for (int i = -100; i <= 100; i++) {
+        uintptr_t try_addr = target_page + (i * page_size);
+        // Check if within ±128MB range
+        int64_t offset = (int64_t)try_addr - (int64_t)target_addr;
+        if (offset >= -0x8000000 && offset <= 0x7FFFFFF) {
+            trampoline = mmap((void*)try_addr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (trampoline != MAP_FAILED) {
+                break;
+            }
+        }
+    }
+    
+    // If near allocation failed, try allocating anywhere
+    if (trampoline == nullptr || trampoline == MAP_FAILED) {
+        trampoline = mmap(nullptr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     
     if (trampoline == nullptr || trampoline == MAP_FAILED) {
         LOGE("Failed to allocate trampoline memory");
@@ -227,16 +248,21 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     // Calculate offset from target to trampoline
     int64_t offset_to_trampoline = (int64_t)trampoline - (int64_t)target_addr;
     
-    // Check if we can reach trampoline
-    if (offset_to_trampoline < -0x8000000 || offset_to_trampoline > 0x7FFFFFF) {
-        LOGE("Trampoline offset out of range: %" PRId64, offset_to_trampoline);
-        munmap(trampoline, page_size);
-        return false;
-    }
-    
     // Replace target function with branch to trampoline
-    uint32_t branch_to_trampoline = 0x14000000 | ((offset_to_trampoline >> 2) & 0x3FFFFFF);
-    target_code[0] = branch_to_trampoline;
+    if (offset_to_trampoline >= -0x8000000 && offset_to_trampoline <= 0x7FFFFFF) {
+        // Use relative branch (within ±128MB range)
+        uint32_t branch_to_trampoline = 0x14000000 | ((offset_to_trampoline >> 2) & 0x3FFFFFF);
+        target_code[0] = branch_to_trampoline;
+    } else {
+        // Trampoline is too far, use absolute address jump
+        // LDR x16, [PC+8]; BR x16; .quad trampoline_addr
+        target_code[0] = 0x58000050; // LDR x16, [PC, #8]
+        target_code[1] = 0xD61F0200; // BR x16
+        *(uint64_t*)(&target_code[2]) = (uint64_t)trampoline;
+        // Fill 4th instruction with NOP
+        target_code[3] = 0xD503201F; // NOP
+        LOGW("Trampoline too far (offset: %" PRId64 "), using absolute jump", offset_to_trampoline);
+    }
     
     // Fill remaining space with NOPs (optional, for safety)
     for (int i = 1; i < 4; i++) {
@@ -309,4 +335,3 @@ void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
 }
 
 #endif // ENABLE_NETWORK_HOOK
-
