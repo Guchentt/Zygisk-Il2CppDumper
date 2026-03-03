@@ -39,19 +39,19 @@ void hack_start(const char *game_data_dir) {
             LOGI("[2/2] Generating script.json...");
             dump_script_json(game_data_dir);
             
-            // 3. Install network hooks for logging network communication
-            // Hook after script.json is generated so we can read method addresses from it
+            // 3. Install encrypt function hook
+            // Hook encrypt function to log encryption keys
 #if ENABLE_NETWORK_HOOK
-            LOGI("[3/3] Installing network hooks from script.json...");
+            LOGI("[3/3] Installing encrypt function hook...");
             hook_network_methods(handle, game_data_dir);
 #else
-            LOGI("[3/3] Network hooks disabled (ENABLE_NETWORK_HOOK=0)");
+            LOGI("[3/3] Encrypt hooks disabled (ENABLE_NETWORK_HOOK=0)");
 #endif
             
             LOGI("==========================================");
             LOGI("All files exported successfully!");
 #if ENABLE_NETWORK_HOOK
-            LOGI("Network hooks installed!");
+            LOGI("Encrypt hook installed!");
 #endif
             LOGI("Output directory: %s/files/", game_data_dir);
             LOGI("==========================================");

@@ -1,5 +1,5 @@
 //
-// Network Hook implementation for logging network communication
+// Encrypt Hook implementation for logging encryption function calls
 //
 
 #include "network_hook.h"
@@ -9,274 +9,131 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cinttypes>
+#include <cstdio>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <iomanip>
 
 #if !ENABLE_NETWORK_HOOK
 // Hook disabled, provide empty implementation
 void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
-    LOGI("Network hooks are disabled");
+    LOGI("Encrypt hooks are disabled");
 }
 #else
 
-// Simple JSON parser to extract method VA from script.json
-// param_count: -1 means any, otherwise match specific parameter count
-static uint64_t find_method_va_from_json(const std::string& json_content, 
-                                         const std::string& class_name, 
-                                         const std::string& method_name,
-                                         int param_count = -1) {
-    // Look for pattern: "name": "ClassName" followed by methods array
-    // Then find "name": "MethodName" with matching paramCount and extract "va": "0x..."
-    
-    size_t class_pos = json_content.find("\"name\": \"" + class_name + "\"");
-    if (class_pos == std::string::npos) {
-        LOGW("Class %s not found in script.json", class_name.c_str());
-        return 0;
+// Encrypt function offset from base address
+#define ENCRYPT_FUNCTION_OFFSET 0x45FC70C
+
+// Original encrypt function pointer
+static void (*Encrypt_Function_Original)(void *arg0) = nullptr;
+
+// Helper function to convert bytes to hex string
+static std::string bytes_to_hex(const uint8_t *data, size_t length) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < length; i++) {
+        ss << std::setw(2) << static_cast<unsigned>(data[i]);
     }
-    
-    // Find methods array after class name
-    size_t methods_pos = json_content.find("\"methods\": [", class_pos);
-    if (methods_pos == std::string::npos) {
-        LOGW("Methods array not found for class %s", class_name.c_str());
-        return 0;
-    }
-    
-    // Find the end of methods array (to limit search scope)
-    size_t methods_end = json_content.find("],", methods_pos);
-    if (methods_end == std::string::npos) {
-        methods_end = json_content.find("\n          ]", methods_pos);
-    }
-    if (methods_end == std::string::npos) {
-        methods_end = json_content.length();
-    }
-    
-    // Search for method name within methods array
-    size_t search_pos = methods_pos;
-    while (true) {
-        size_t method_name_pos = json_content.find("\"name\": \"" + method_name + "\"", search_pos);
-        if (method_name_pos == std::string::npos || method_name_pos > methods_end) {
-            LOGW("Method %s::%s not found in script.json", class_name.c_str(), method_name.c_str());
-            return 0;
-        }
-        
-        // Check paramCount if specified
-        if (param_count >= 0) {
-            size_t param_count_pos = json_content.find("\"paramCount\":", method_name_pos);
-            if (param_count_pos != std::string::npos && param_count_pos < methods_end) {
-                size_t param_value_start = json_content.find_first_of("0123456789", param_count_pos + 13);
-                if (param_value_start != std::string::npos) {
-                    size_t param_value_end = json_content.find_first_not_of("0123456789", param_value_start);
-                    std::string param_str = json_content.substr(param_value_start, param_value_end - param_value_start);
-                    int found_param_count = std::stoi(param_str);
-                    
-                    if (found_param_count != param_count) {
-                        // Not the right overload, continue searching
-                        search_pos = method_name_pos + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        
-        // Find "va" field after method name
-        size_t va_pos = json_content.find("\"va\":", method_name_pos);
-        if (va_pos == std::string::npos || va_pos > methods_end) {
-            search_pos = method_name_pos + 1;
-            continue;
-        }
-        
-        // Extract hex value: "va": "0x1234567890abcdef"
-        size_t quote_start = json_content.find('"', va_pos + 5);
-        if (quote_start == std::string::npos || quote_start > methods_end) {
-            search_pos = method_name_pos + 1;
-            continue;
-        }
-        
-        size_t quote_end = json_content.find('"', quote_start + 1);
-        if (quote_end == std::string::npos || quote_end > methods_end) {
-            search_pos = method_name_pos + 1;
-            continue;
-        }
-        
-        std::string va_str = json_content.substr(quote_start + 1, quote_end - quote_start - 1);
-        
-        // Parse hex string
-        uint64_t va = 0;
-        if (va_str.length() > 2 && va_str.substr(0, 2) == "0x") {
-            std::istringstream iss(va_str);
-            iss >> std::hex >> va;
-        } else if (!va_str.empty() && va_str != "0") {
-            std::istringstream iss(va_str);
-            iss >> std::hex >> va;
-        }
-        
-        // Validate VA (should be non-zero and reasonable)
-        if (va != 0 && va > 0x1000000 && va < 0x7FFFFFFFFFFFFFFF) {
-            LOGI("Found %s::%s (paramCount=%d) at VA: 0x%" PRIx64, 
-                 class_name.c_str(), method_name.c_str(), param_count, va);
-            return va;
-        }
-        
-        // Invalid VA, continue searching
-        search_pos = method_name_pos + 1;
-    }
-    
-    return 0;
+    return ss.str();
 }
 
-// Il2Cpp base address
-extern uint64_t il2cpp_base;
-
-// Function hook structure
-struct HookInfo {
-    void *original_func;
-    void *hook_func;
-    uint8_t original_bytes[16];
-    size_t patch_size;
-};
-
-// Hook XNetwork.Send(String handler, Byte[] content)
-// VA: 0x770936decbf8
-static void (*XNetwork_Send_String_ByteArray_Original)(void *handler_str, void *content_bytes) = nullptr;
-
-// Hook XNetwork.Call(String handler, Byte[] content, ...)
-// VA: 0x770936decd20
-static void (*XNetwork_Call_String_ByteArray_Original)(void *handler_str, void *content_bytes, void *reply, void *exceptionReply, bool excludeMask) = nullptr;
-
-// Hook XNetwork.ProcessMessage(Object msg, Int32 seqNo)
-// VA: 0x770936dec648
-static void (*XNetwork_ProcessMessage_Original)(void *msg, int32_t seqNo) = nullptr;
-
-// Hook XHttp.PostAsync(String url, String content)
-// VA: 0x7709379335d8
-static void (*XHttp_PostAsync_Original)(void *url_str, void *content_str) = nullptr;
-
-// Helper function to get string from Il2CppString (safe version)
-static std::string get_il2cpp_string(void *str_obj) {
-    if (!str_obj) return "[null]";
+// Hook wrapper for encrypt function
+// Based on Frida script logic:
+// - args[0] is the first parameter
+// - Read pointer from args[0] -> struct_ptr
+// - Read pointer from struct_ptr + 0xB8 -> key_array_ptr
+// - Read U32 from key_array_ptr + 24 -> key_length
+// - Read ByteArray from key_array_ptr + 32 -> key_data
+static void Encrypt_Function_Hook_Wrapper(void *arg0) {
+    LOGI("[*] Encrypt function called");
+    LOGI("[*] arg0: %p", arg0);
     
-    // Il2CppString layout: length (offset 0x10), chars (offset 0x14)
-    // Read directly from memory with bounds checking
-    uint8_t *base = (uint8_t*)str_obj;
-    
-    // Check if memory is readable (basic check)
-    if ((uintptr_t)base < 0x1000 || (uintptr_t)base > 0x7FFFFFFFFFFFFFFF) {
-        return "[invalid_ptr]";
+    // Always call original function first to avoid blocking
+    if (Encrypt_Function_Original) {
+        Encrypt_Function_Original(arg0);
     }
     
-    int32_t length = 0;
-    // Try to read length safely
-    __builtin_memcpy(&length, base + 0x10, sizeof(int32_t));
-    
-    if (length > 0 && length < 1000) {  // Reduced max length for safety
-        char16_t *chars = (char16_t*)(base + 0x14);
-        std::string result;
-        result.reserve(length);
-        for (int i = 0; i < length && i < 1000; i++) {
-            uint16_t c = chars[i];
-            if (c < 128 && c != 0) {
-                result += (char)c;
-            }
-        }
-        if (result.empty()) {
-            return "[empty_string]";
-        }
-        return result;
+    // Then try to read key data (non-blocking)
+    if (!arg0) {
+        LOGW("[*] arg0 is null, skipping");
+        return;
     }
-    return "[invalid_length]";
-}
-
-// Helper function to get byte array info (safe version)
-static std::string get_byte_array_info(void *array_obj) {
-    if (!array_obj) return "[null]";
-    
-    // Il2CppArray layout: length (offset 0x18), data (offset 0x20)
-    // Read directly from memory with bounds checking
-    uint8_t *base = (uint8_t*)array_obj;
     
     // Check if memory is readable
-    if ((uintptr_t)base < 0x1000 || (uintptr_t)base > 0x7FFFFFFFFFFFFFFF) {
-        return "[invalid_ptr]";
+    if ((uintptr_t)arg0 < 0x1000 || (uintptr_t)arg0 > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] arg0 has invalid address: %p", arg0);
+        return;
     }
     
-    int32_t length = 0;
-    __builtin_memcpy(&length, base + 0x18, sizeof(int32_t));
+    // Use signal-safe memory reading
+    void *struct_ptr = nullptr;
+    __builtin_memcpy(&struct_ptr, arg0, sizeof(void*));
+    LOGI("[*] struct_ptr: %p", struct_ptr);
     
-    if (length >= 0 && length < 1000000) {
-        char buffer[64];
-        snprintf(buffer, sizeof(buffer), "ByteArray[%d]", length);
-        return buffer;
-    }
-    return "[invalid_length]";
-}
-
-// Hook wrapper for XNetwork.Send
-static void XNetwork_Send_String_ByteArray_Hook_Wrapper(void *handler_str, void *content_bytes) {
-    // Call original function FIRST to avoid blocking
-    if (XNetwork_Send_String_ByteArray_Original) {
-        XNetwork_Send_String_ByteArray_Original(handler_str, content_bytes);
+    if (!struct_ptr) {
+        LOGW("[*] struct_ptr is null");
+        return;
     }
     
-    // Then log (non-blocking)
-    std::string handler = get_il2cpp_string(handler_str);
-    std::string content_info = get_byte_array_info(content_bytes);
-    
-    LOGI("=== NETWORK SEND ===");
-    LOGI("Handler: %s", handler.c_str());
-    LOGI("Content: %s", content_info.c_str());
-    LOGI("===================");
-}
-
-// Hook wrapper for XNetwork.Call
-static void XNetwork_Call_String_ByteArray_Hook_Wrapper(void *handler_str, void *content_bytes, void *reply, void *exceptionReply, bool excludeMask) {
-    // Call original function FIRST to avoid blocking
-    if (XNetwork_Call_String_ByteArray_Original) {
-        XNetwork_Call_String_ByteArray_Original(handler_str, content_bytes, reply, exceptionReply, excludeMask);
+    // Check struct_ptr validity
+    if ((uintptr_t)struct_ptr < 0x1000 || (uintptr_t)struct_ptr > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] struct_ptr has invalid address: %p", struct_ptr);
+        return;
     }
     
-    // Then log (non-blocking)
-    std::string handler = get_il2cpp_string(handler_str);
-    std::string content_info = get_byte_array_info(content_bytes);
+    // Read key array pointer from struct_ptr + 0xB8
+    void *key_array_ptr = nullptr;
+    uint8_t *struct_base = (uint8_t*)struct_ptr;
+    __builtin_memcpy(&key_array_ptr, struct_base + 0xB8, sizeof(void*));
+    LOGI("[*] Key array address: %p", key_array_ptr);
     
-    LOGI("=== NETWORK CALL ===");
-    LOGI("Handler: %s", handler.c_str());
-    LOGI("Content: %s", content_info.c_str());
-    LOGI("ExcludeMask: %s", excludeMask ? "true" : "false");
-    LOGI("===================");
-}
-
-// Hook wrapper for XNetwork.ProcessMessage
-static void XNetwork_ProcessMessage_Hook_Wrapper(void *msg, int32_t seqNo) {
-    // Call original function FIRST to avoid blocking
-    if (XNetwork_ProcessMessage_Original) {
-        XNetwork_ProcessMessage_Original(msg, seqNo);
+    if (!key_array_ptr) {
+        LOGW("[*] key_array_ptr is null");
+        return;
     }
     
-    // Then log (non-blocking)
-    LOGI("=== NETWORK RECEIVE ===");
-    LOGI("Message SeqNo: %d", seqNo);
-    LOGI("Message Object: %p", msg);
-    LOGI("======================");
-}
-
-// Hook wrapper for XHttp.PostAsync
-static void XHttp_PostAsync_Hook_Wrapper(void *url_str, void *content_str) {
-    // Call original function FIRST to avoid blocking
-    if (XHttp_PostAsync_Original) {
-        XHttp_PostAsync_Original(url_str, content_str);
+    // Check key_array_ptr validity
+    if ((uintptr_t)key_array_ptr < 0x1000 || (uintptr_t)key_array_ptr > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] key_array_ptr has invalid address: %p", key_array_ptr);
+        return;
     }
     
-    // Then log (non-blocking)
-    std::string url = get_il2cpp_string(url_str);
-    std::string content = get_il2cpp_string(content_str);
+    // Read key length from key_array_ptr + 24
+    uint32_t key_length = 0;
+    uint8_t *key_array_base = (uint8_t*)key_array_ptr;
+    __builtin_memcpy(&key_length, key_array_base + 24, sizeof(uint32_t));
+    LOGI("[*] Key length: %u", key_length);
     
-    LOGI("=== HTTP POST ===");
-    LOGI("URL: %s", url.c_str());
-    LOGI("Content: %s", content.c_str());
-    LOGI("================");
+    // Validate key length
+    if (key_length == 0 || key_length > 1024) {
+        LOGW("[*] Invalid key length: %u", key_length);
+        return;
+    }
+    
+    // Read key data from key_array_ptr + 32
+    uint8_t *key_data_ptr = key_array_base + 32;
+    
+    // Check if we can safely read the key data
+    if ((uintptr_t)key_data_ptr < 0x1000 || 
+        (uintptr_t)key_data_ptr > 0x7FFFFFFFFFFFFFFF ||
+        (uintptr_t)(key_data_ptr + key_length) > 0x7FFFFFFFFFFFFFFF) {
+        LOGW("[*] Key data pointer out of bounds");
+        return;
+    }
+    
+    // Read key data
+    uint8_t *key_data = new uint8_t[key_length];
+    __builtin_memcpy(key_data, key_data_ptr, key_length);
+    
+    // Convert to hex string
+    std::string key_hex = bytes_to_hex(key_data, key_length);
+    LOGI("[*] Key (hex): %s", key_hex.c_str());
+    LOGI("[*] Key: %s", key_hex.c_str());
+    
+    delete[] key_data;
 }
 
 // Install function hook using inline hook with trampoline
@@ -390,98 +247,68 @@ static bool install_hook(void *target_addr, void *hook_func, FuncPtr *original_f
     }
 }
 
-// Hook network methods
+// Hook encrypt function
 void hook_network_methods(void *il2cpp_handle, const char *game_data_dir) {
-    LOGI("Installing network hooks from script.json...");
+    LOGI("Installing encrypt function hook...");
     
     if (!il2cpp_handle) {
         LOGE("Invalid il2cpp handle");
         return;
     }
     
-    if (!game_data_dir) {
-        LOGE("Invalid game_data_dir");
+    // Get libil2cpp.so base address from handle
+    Dl_info dlInfo;
+    uint64_t target_base = 0;
+    
+    // Try to get base address using dladdr on the handle
+    if (dladdr(il2cpp_handle, &dlInfo)) {
+        target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+        LOGI("Found libil2cpp.so base: 0x%" PRIx64, target_base);
+    } else {
+        // Fallback: try to get base from any symbol in the handle
+        void *sym = dlsym(il2cpp_handle, "il2cpp_init");
+        if (sym && dladdr(sym, &dlInfo)) {
+            target_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+            LOGI("Found libil2cpp.so base via symbol: 0x%" PRIx64, target_base);
+        } else {
+            LOGE("Failed to get libil2cpp.so base address");
+            return;
+        }
+    }
+    
+    if (target_base == 0) {
+        LOGE("Failed to find libil2cpp.so base address");
         return;
     }
     
-    // Read script.json file
-    std::string script_json_path = std::string(game_data_dir) + "/files/script.json";
-    std::ifstream json_file(script_json_path);
-    if (!json_file) {
-        LOGE("Failed to open script.json: %s", script_json_path.c_str());
-        return;
+    // Calculate encrypt function address: base + offset
+    uint64_t encrypt_addr = target_base + ENCRYPT_FUNCTION_OFFSET;
+    void *encrypt_func_ptr = (void*)encrypt_addr;
+    
+    LOGI("Target module base: 0x%" PRIx64, target_base);
+    LOGI("Encrypt function offset: 0x%X", ENCRYPT_FUNCTION_OFFSET);
+    LOGI("Encrypt function address: 0x%" PRIx64 " (%p)", encrypt_addr, encrypt_func_ptr);
+    
+    // Verify the address is readable
+    Dl_info verifyInfo;
+    if (dladdr(encrypt_func_ptr, &verifyInfo)) {
+        LOGI("Address verified, belongs to: %s", verifyInfo.dli_fname ? verifyInfo.dli_fname : "unknown");
+    } else {
+        LOGW("Warning: Could not verify address with dladdr");
     }
     
-    // Read entire file into string
-    std::stringstream json_buffer;
-    json_buffer << json_file.rdbuf();
-    std::string json_content = json_buffer.str();
-    json_file.close();
-    
-    LOGI("Loaded script.json (%zu bytes)", json_content.size());
-    
-    // Extract method addresses from JSON
-    // XNetwork.Send(String, Byte[]) - paramCount=2
-    uint64_t XNetwork_Send_VA = find_method_va_from_json(json_content, "XNetwork", "Send", 2);
-    
-    // XNetwork.Call(String, Byte[], Action, Action, bool) - paramCount=5
-    uint64_t XNetwork_Call_VA = find_method_va_from_json(json_content, "XNetwork", "Call", 5);
-    
-    // XNetwork.ProcessMessage(Object, Int32) - paramCount=2
-    uint64_t XNetwork_ProcessMessage_VA = find_method_va_from_json(json_content, "XNetwork", "ProcessMessage", 2);
-    
-    // XHttp.PostAsync(String, String) - paramCount=2
-    uint64_t XHttp_PostAsync_VA = find_method_va_from_json(json_content, "XHttp", "PostAsync", 2);
-    
-    // Wait a bit for il2cpp to fully initialize
+    // Wait a bit for module to be fully loaded
     sleep(2);
     
-    // Install hooks
-    if (XNetwork_Send_VA != 0) {
-        LOGI("Hooking XNetwork.Send at %p", (void*)XNetwork_Send_VA);
-        if (install_hook((void*)XNetwork_Send_VA, (void*)XNetwork_Send_String_ByteArray_Hook_Wrapper, &XNetwork_Send_String_ByteArray_Original)) {
-            LOGI("✓ XNetwork.Send hooked successfully");
-        } else {
-            LOGW("✗ Failed to hook XNetwork.Send");
-        }
+    // Install hook
+    LOGI("Installing hook at %p", encrypt_func_ptr);
+    if (install_hook(encrypt_func_ptr, (void*)Encrypt_Function_Hook_Wrapper, &Encrypt_Function_Original)) {
+        LOGI("✓ Encrypt function hooked successfully");
     } else {
-        LOGW("✗ XNetwork.Send address not found in script.json");
+        LOGE("✗ Failed to hook encrypt function");
     }
     
-    if (XNetwork_Call_VA != 0) {
-        LOGI("Hooking XNetwork.Call at %p", (void*)XNetwork_Call_VA);
-        if (install_hook((void*)XNetwork_Call_VA, (void*)XNetwork_Call_String_ByteArray_Hook_Wrapper, &XNetwork_Call_String_ByteArray_Original)) {
-            LOGI("✓ XNetwork.Call hooked successfully");
-        } else {
-            LOGW("✗ Failed to hook XNetwork.Call");
-        }
-    } else {
-        LOGW("✗ XNetwork.Call address not found in script.json");
-    }
-    
-    if (XNetwork_ProcessMessage_VA != 0) {
-        LOGI("Hooking XNetwork.ProcessMessage at %p", (void*)XNetwork_ProcessMessage_VA);
-        if (install_hook((void*)XNetwork_ProcessMessage_VA, (void*)XNetwork_ProcessMessage_Hook_Wrapper, &XNetwork_ProcessMessage_Original)) {
-            LOGI("✓ XNetwork.ProcessMessage hooked successfully");
-        } else {
-            LOGW("✗ Failed to hook XNetwork.ProcessMessage");
-        }
-    } else {
-        LOGW("✗ XNetwork.ProcessMessage address not found in script.json");
-    }
-    
-    if (XHttp_PostAsync_VA != 0) {
-        LOGI("Hooking XHttp.PostAsync at %p", (void*)XHttp_PostAsync_VA);
-        if (install_hook((void*)XHttp_PostAsync_VA, (void*)XHttp_PostAsync_Hook_Wrapper, &XHttp_PostAsync_Original)) {
-            LOGI("✓ XHttp.PostAsync hooked successfully");
-        } else {
-            LOGW("✗ Failed to hook XHttp.PostAsync");
-        }
-    } else {
-        LOGW("✗ XHttp.PostAsync address not found in script.json");
-    }
-    
-    LOGI("Network hooks installation completed");
+    LOGI("Encrypt hook installation completed");
 }
 
 #endif // ENABLE_NETWORK_HOOK
